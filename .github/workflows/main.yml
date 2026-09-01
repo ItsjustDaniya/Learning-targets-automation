@@ -1,0 +1,48 @@
+name: Learning Targets Sync
+
+# Runs learning_targets_sync.py twice a day to keep the LT_Assignment,
+# LT_Attendance, LT_Contest and LT_Inactivity tabs fresh, and lets you
+# trigger a one-off run manually from the Actions tab (Run workflow button)
+# without waiting for the schedule.
+#
+# Setup required once, in this repo's Settings > Secrets and variables >
+# Actions (skip this if you're adding this workflow to a repo that already
+# runs your other Metabase/Sheets pipeline with these same secret names):
+#   METABASE_API_KEY     - your Metabase API key
+#   SERVICE_ACCOUNT_JSON  - the full JSON of the Google service account key
+#                            (paste the whole file contents as the secret)
+#
+# Also make sure the target spreadsheet (LEARNING_TARGETS_SHEET_KEY in
+# learning_targets_sync.py) is shared with that service account's
+# client_email as an Editor - the script can create new tabs inside it,
+# but not access to the spreadsheet itself.
+
+on:
+  schedule:
+    # Runs twice a day. Cron is in UTC, not IST - shift the hours to match
+    # if you want different local run times.
+    - cron: '0 4 * * *'   # 04:00 UTC = ~09:30 IST (morning refresh)
+    - cron: '0 13 * * *'  # 13:00 UTC = ~18:30 IST (evening refresh)
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Learning Targets sync
+        env:
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+        run: python learning_targets_sync.py
