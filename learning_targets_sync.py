@@ -106,15 +106,31 @@ LEARNING_TARGETS_SHEET_KEY = "1qbZKVJ3Q_QnbQZ5Vzo8k-9f8Fo4Yu2Rsr4emBKUeHNM"
 # SHARED HELPERS
 # ============================================================================
 
-def mb_post(card_id, timeout=120):
-    """POST to a Metabase card's query endpoint and return parsed JSON rows."""
+def mb_post(card_id, timeout=600, max_attempts=3):
+    """
+    POST to a Metabase card's query endpoint and return parsed JSON rows.
+
+    timeout defaults to 600s (was 120s) - a live run timed out at 120s on
+    one of the Assignment cards; your own notebook uses timeout=3600 for
+    these same large-join cards, so 120s was always going to be too tight.
+    Also retries on timeout/connection errors, since a single slow query
+    shouldn't fail the whole run.
+    """
     url = f"{METABASE_URL}/api/card/{card_id}/query/json"
-    r = requests.post(url, headers=METABASE_HEADERS, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    if not data:
-        print(f"Warning: card {card_id} returned no rows")
-    return pd.DataFrame(data)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(url, headers=METABASE_HEADERS, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                print(f"Warning: card {card_id} returned no rows")
+            return pd.DataFrame(data)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_attempts:
+                print(f"  Card {card_id} attempt {attempt}/{max_attempts} failed ({e}) - retrying...")
+                time.sleep(10 * attempt)
+            else:
+                raise
 
 
 def get_or_create_worksheet(sheet, worksheet_name, rows=2000, cols=26):
@@ -199,6 +215,22 @@ MODULE_NAME_DISPLAY = {
     "DS 02 Spreadsheets": "Spreadsheet",
     "DS 04 SQL": "SQL",
 }
+
+
+def add_batch_col_from_month_letter(df, source_col):
+    """
+    Adds a 'Batch' column (e.g. 'August 2026 A', or just 'August 2026' when
+    there's no A/B split) parsed out of df[source_col] via parse_month_letter.
+    Small shared helper so Contest/Inactivity/Attendance format this the
+    same way instead of three slightly-different inline versions.
+    """
+    df = df.copy()
+    df[["_month", "_letter"]] = df[source_col].apply(lambda b: pd.Series(parse_month_letter(b)))
+    df["Batch"] = df.apply(
+        lambda r: f"{r['_month']} {r['_letter']}".strip() if pd.notna(r["_letter"]) else str(r["_month"]),
+        axis=1,
+    )
+    return df
 
 # ============================================================================
 # SECTION: ASSIGNMENT  (VALIDATED against your real export - see chat)
@@ -301,13 +333,20 @@ ATTENDANCE_CARD_COC = 11634
 ATTENDANCE_CARD_WOW = 11789
 
 
+CYCLE_LABEL_RE = re.compile(r"^C\d+-\d+$")
+
+
 def cycle_label(class_number):
     """
-    ASSUMPTION: Learning Targets' 'C1-3', 'C4-6', ... cycle columns are
-    3-class blocks numbered off the lecture's class_number field within its
-    module. class_number=1,2,3 -> C1-3; 4,5,6 -> C4-6; etc. Confirm this
-    against a batch where you already know the right cycle by eye.
+    CONFIRMED on a live run: this card's 'class_number' field is NOT a raw
+    per-lecture integer - it already comes back as a pre-formatted cycle
+    string like 'C10-12' (int('C10-12') is what threw the original
+    ValueError). So: pass those straight through unchanged. Only fall back
+    to computing the C{start}-{end} grouping ourselves if we ever get a
+    genuine integer lecture-sequence number instead.
     """
+    if isinstance(class_number, str) and CYCLE_LABEL_RE.match(class_number.strip()):
+        return class_number.strip()
     n = int(class_number)
     block = (n - 1) // 3
     start = block * 3 + 1
@@ -391,21 +430,62 @@ def run_lt_attendance():
 
 # ============================================================================
 # SECTION: CONTEST (Module Contest + Mid Module Contest)
-# UNVALIDATED - written from your notebook's logic (threshold=64, dedup by
-# highest score, 1-day-apart merge). KNOWN GAP: your notebook's final_report
-# for both contests keeps 'admin_unit_name' (the generic monthly AU name,
-# e.g. "...August 2026") but NOT a batch_name-style A/B field, so as written
-# your pipeline can't currently tell "July 2026 A" apart from "July 2026 B"
-# the way the Learning Targets sheet's Contest section needs. The raw
-# MC_Raw_2 / Mid_MC_Raw sheets likely DO have a more granular batch column
-# (they must, since some other part of your ops process reports A vs B
-# contest results) - I don't have visibility into MC_Raw_2/Mid_MC_Raw's
-# exact columns from here. Below assumes it's called 'batch_name'; check
-# the actual sheet and adjust CONTEST_BATCH_COL if it's named differently.
+# CONFIRMED on a live run: MC_Raw_2's actual columns are user_id,
+# student_name, admin_unit_name, contest_date, module_name,
+# contest_name_x, contest_name_y, MCQ_score, Coding_score, Total Score -
+# no batch-letter field anywhere (same shape expected for Mid_MC_Raw).
+# Fix: recover the A/B batch the same way your own notebook does
+# everywhere else it needs one - merge in Master Data 2023-2026 by
+# user_id and read its Batch/Batch Name column instead of expecting the
+# contest sheet to carry it itself. See _load_master_data() below.
 # ============================================================================
 
-CONTEST_BATCH_COL = "batch_name"  # <-- verify against the real MC_Raw_2 / Mid_MC_Raw sheet
 CONTEST_THRESHOLD = 64
+
+_master_data_cache = None
+
+
+def _load_master_data():
+    """
+    Loads user_id -> Batch Name once per run and caches it. This is the
+    same 'DS Full program - All Intake 2026' / 'Master Data 2023-2026'
+    sheet your notebook merges into nearly every section for batch/persona
+    info - used here specifically to recover the A/B batch letter that
+    MC_Raw_2/Mid_MC_Raw (and possibly the inactivity card) don't carry
+    themselves.
+    """
+    global _master_data_cache
+    if _master_data_cache is not None:
+        return _master_data_cache
+
+    ws = gc.open("DS Full program - All Intake 2026").worksheet("Master Data 2023-2026")
+    data = ws.get_all_values()
+    df = pd.DataFrame(data[1:], columns=data[0])
+    df = df.rename(columns={"User ID ": "user_id"})
+    df["user_id"] = df["user_id"].astype(str).str.strip()
+
+    batch_col = "Batch Name" if "Batch Name" in df.columns else ("Batch" if "Batch" in df.columns else None)
+    if batch_col is None:
+        raise KeyError(
+            f"Master Data 2023-2026 has neither 'Batch Name' nor 'Batch' column - "
+            f"columns present: {list(df.columns)}. Update _load_master_data()."
+        )
+
+    _master_data_cache = (
+        df[["user_id", batch_col]]
+        .rename(columns={batch_col: "_master_batch_name"})
+        .drop_duplicates(subset="user_id")
+    )
+    return _master_data_cache
+
+
+def _attach_batch_from_master_data(df, user_id_col="user_id"):
+    """Left-joins Master Data's batch name onto df by user_id."""
+    master = _load_master_data()
+    df = df.copy()
+    df[user_id_col] = df[user_id_col].astype(str).str.strip()
+    df = df.merge(master, left_on=user_id_col, right_on="user_id", how="left", suffixes=("", "_md"))
+    return df
 
 
 def _contest_actuals(raw_sheet_name, raw_worksheet_name, contest_label):
@@ -414,23 +494,20 @@ def _contest_actuals(raw_sheet_name, raw_worksheet_name, contest_label):
     data = ws.get_all_values()
     df = pd.DataFrame(data[1:], columns=data[0])
 
-    if CONTEST_BATCH_COL not in df.columns:
-        print(
-            f"  WARNING: '{CONTEST_BATCH_COL}' not found in {raw_worksheet_name}. "
-            f"Columns present: {list(df.columns)}. Skipping {contest_label} - "
-            f"set CONTEST_BATCH_COL to the right column name and rerun."
-        )
-        return pd.DataFrame()
-
     df["Total Score"] = pd.to_numeric(df["Total Score"].astype(str).str.replace(",", ""), errors="coerce")
     df["user_id"] = df["user_id"].astype(str).str.strip()
-    df[["_month", "_letter"]] = df[CONTEST_BATCH_COL].apply(lambda b: pd.Series(parse_month_letter(b)))
+
+    df = _attach_batch_from_master_data(df)
+    unmatched_pct = df["_master_batch_name"].isna().mean() * 100
+    if unmatched_pct > 20:
+        print(f"  WARNING: {unmatched_pct:.0f}% of {raw_worksheet_name} rows didn't match a "
+              f"user_id in Master Data - Batch/A-B info will be missing for those rows.")
+
+    df[["_month", "_letter"]] = df["_master_batch_name"].apply(lambda b: pd.Series(parse_month_letter(b)))
 
     # Highest score per student for this contest (mirrors your notebook's
     # Highest_Score_Overall / Status logic).
-    best = df.sort_values("Total Score", ascending=False).drop_duplicates(
-        subset=["user_id", CONTEST_BATCH_COL]
-    )
+    best = df.sort_values("Total Score", ascending=False).drop_duplicates(subset=["user_id", "module_name"])
     best["Cleared"] = best["Total Score"] >= CONTEST_THRESHOLD
     best["Attempted"] = best["Total Score"].notna()
 
@@ -456,16 +533,24 @@ def run_lt_contest():
     """
     Rebuilds LT_Contest: one row per (Contest, Month, Batch letter) with
     Actual Attempt% / Clearance%, matching the Target(Attempt/Clearance) vs
-    Actual shape of the sheet's Contest section. See the KNOWN GAP note
-    above about the A/B batch column before trusting this.
+    Actual shape of the sheet's Contest section. Batch A/B comes from a
+    Master Data join by user_id (see _load_master_data()), since the raw
+    contest sheets don't carry it themselves - check the "unmatched"
+    WARNING in the log if this looks off.
     """
     print("Running: LT_Contest")
     module_contest = _contest_actuals("Placements", "MC_Raw_2", "Module Contest")
     mid_module_contest = _contest_actuals("Placements", "Mid_MC_Raw", "Mid Module Contest")
     out = pd.concat([module_contest, mid_module_contest], ignore_index=True)
     if out.empty:
-        print("  Nothing to write - fix CONTEST_BATCH_COL first.")
-        return
+        # Raise instead of silently returning - a silent return here made
+        # this task count as "succeeded" in the run summary while writing
+        # no tab at all. Check the "unmatched" WARNING above for whether
+        # the Master Data join is the culprit.
+        raise RuntimeError(
+            "LT_Contest has nothing to write - see the WARNING line(s) above "
+            "for which raw sheet/column lookup failed."
+        )
     out = out.sort_values(["Contest", "Month", "Batch"])
     write_sheet(LEARNING_TARGETS_SHEET_KEY, "LT_Contest", out)
 
@@ -540,35 +625,44 @@ def run_lt_inactivity():
     sheet's Inactivity section. Does NOT write the High-Risk Flag - that
     stays a manual OK/not-OK call per your instructions.
 
-    ASSUMPTION: groups by a 'batch_name' column if the card returns one
-    (so August A and August B stay separate, matching the sheet's layout);
-    otherwise falls back to your notebook's month-only cohort (from
-    batch_month_start), which would merge A/B together. Check which case
-    you're in on the first run - if it falls back, this needs the same
-    fix as the Contest section's batch-column gap.
+    Batch A/B resolution order: (1) Master Data join by user_id - same fix
+    as Contest, since that's the pattern your notebook uses everywhere else
+    for batch info; (2) this card's own 'batch_name' column, if it has one
+    and the Master Data join mostly missed; (3) month-only cohort from
+    batch_month_start as a last resort, which merges A/B together - watch
+    for that WARNING in the log.
     """
     print("Running: LT_Inactivity")
     df = mb_post(INACTIVITY_STREAK_CARD_ID)
     if df.empty:
-        print("  No data returned - skipping.")
-        return
+        # Raise instead of silently returning, same reasoning as Contest:
+        # a bare "return" here made a card that comes back empty count as
+        # a "success" in the run summary while writing no tab at all.
+        raise RuntimeError(
+            f"LT_Inactivity: card {INACTIVITY_STREAK_CARD_ID} returned no rows "
+            f"- check the card in Metabase and the Metabase API key."
+        )
 
     df["user_id"] = df["user_id"].astype(str).str.strip()
     df = _normalise_inactivity_flags(df)
 
-    if "batch_name" in df.columns:
-        df[["_month", "_letter"]] = df["batch_name"].apply(lambda b: pd.Series(parse_month_letter(b)))
-        df["Batch"] = df.apply(
-            lambda r: f"{r['_month']} {r['_letter']}".strip() if pd.notna(r["_letter"]) else str(r["_month"]),
-            axis=1,
-        )
-        group_col = "Batch"
+    df = _attach_batch_from_master_data(df)
+    unmatched_pct = df["_master_batch_name"].isna().mean() * 100
+
+    if unmatched_pct <= 20:
+        df = add_batch_col_from_month_letter(df, "_master_batch_name")
+    elif "batch_name" in df.columns:
+        print(f"  WARNING: Master Data join only matched {100 - unmatched_pct:.0f}% of rows - "
+              f"falling back to this card's own 'batch_name' column instead.")
+        df = add_batch_col_from_month_letter(df, "batch_name")
     else:
-        print("  WARNING: no 'batch_name' column on this card - falling back to month-only "
-              "cohort (A/B batches will be merged together). See ASSUMPTION note above.")
+        print(f"  WARNING: Master Data join only matched {100 - unmatched_pct:.0f}% of rows and "
+              "this card has no 'batch_name' column either - falling back to month-only cohort "
+              "(A/B batches will be merged together).")
         df["batch_month_start"] = pd.to_datetime(df.get("batch_month_start"), errors="coerce")
         df["Batch"] = df["batch_month_start"].dt.strftime("%b %Y").fillna("Unknown")
-        group_col = "Batch"
+
+    group_col = "Batch"
 
     rows = []
     for batch, grp in df.groupby(group_col):
@@ -587,6 +681,11 @@ def run_lt_inactivity():
                 "pct_inactive": round(pd.to_numeric(flagged, errors="coerce").mean() * 100),
             })
 
+    if not rows:
+        raise RuntimeError(
+            "LT_Inactivity: no (batch, week) had any elapsed/available data to summarize - "
+            "check the w{i}_available / w{i}_inactive_streak columns on the card."
+        )
     out = pd.DataFrame(rows).sort_values(["Batch", "Week"])
     write_sheet(LEARNING_TARGETS_SHEET_KEY, "LT_Inactivity", out)
 
